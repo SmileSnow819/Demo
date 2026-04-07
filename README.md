@@ -2,550 +2,543 @@
 
 ## 目标
 
-用"登录功能"作为载体，在一个 React + TypeScript 项目中，跑通完整的下一代 AI 编程工作流，**以 OpenSpec 作为 Spec 层的核心基础设施**：
+在现有 React 项目中，通过**扩展 OpenSpec 自定义 Schema**，实现一套完整的"Skill 知识库 + 需求 Loop + 规范驱动实现 + 自动验证"工作流。
+
+**关键认知**：这套工作流运行在 AI IDE（Cursor / Claude Code / CodeFlicker）的对话框里，我们不需要实现对话 UI，我们要做的是：
+
+1. 在 OpenSpec 里创建一个自定义 Schema `loop-driven`
+2. Schema 里新增 `requirement-loop` artifact（放在 `proposal` 之前）
+3. 这个 artifact 的 `instruction` 引导 AI 检索 Skill 知识库、逐条反问用户
+4. 后续正常走 `proposal → specs → design → tasks → /apply → /verify`
 
 ```
-用户自然语言输入："我要实现一个登录功能"
-       ↓
-语义检索：匹配 Skill 库中相关的最佳实践
-       ↓
-AI 对话式补全：针对检索到的 Skill 逐一确认（非静态问卷，而是自然语言反问）
-       ↓
-[OpenSpec: proposal.md + specs/ + design.md + tasks.md]
-       ↓
-[代码实现]
-       ↓
-[OpenSpec: /opsx:verify 规范验证]
+┌─────────────────────────────────────────────────────────────┐
+│  触发路径 A（隐式）            触发路径 B（显式）              │
+│                                                             │
+│  用户: "帮我实现登录功能"      用户: "/opsx:propose add-login" │
+│        ↓                              ↓                     │
+│  AI 检测到需求模糊            AI 等待用户描述需求              │
+│  → "需求描述较模糊，建议先     → "请简单描述你的登录功能需求"   │
+│    用 /opsx:propose 完善，     → 用户输入后                   │
+│    是否继续？"                                               │
+│        ↓（用户确认）                  ↓                     │
+└──────────────────────┬──────────────────────────────────────┘
+                       ↓（两条路在这里汇合）
+[requirement-loop artifact]
+  AI 读取 openspec/skills/login.md 知识库
+  → 逐条询问用户最佳实践选项（在 AI IDE 对话框里完成）
+  → 用户回答 Yes/No 或补充说明
+  → 生成 requirement-loop.md（需求确认文档）
+        ↓
+proposal artifact（依赖 requirement-loop.md）
+  → AI 基于确认后的需求生成 proposal.md
+        ↓
+specs artifact → design artifact → tasks artifact
+        ↓
+/opsx:apply  →  /opsx:verify
 ```
-
-**核心设计原则**：Loop 的触发不是"打开一张问卷表"，而是用户先表达意图，系统语义召回相关 Skill，再以自然对话的方式逐项确认。这更接近真实的 AI 编程助手体验。
 
 ---
 
 <!-- anchor:architecture -->
 
-## 1. Demo 架构设计
+## 1. 整体架构
 
-### 1.1 整体分层
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 0: 意图输入（自然语言对话入口）                      │
-│  IntentInput.tsx                                        │
-│  用户输入："我要实现一个登录功能"                           │
-└──────────────────────────┬──────────────────────────────┘
-                           ↓ 语义检索（关键词 + 标签匹配）
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 1: Skill 库（最佳实践知识库）                       │
-│  src/skills/login-best-practices.ts                     │
-│  → 每条 Skill 有 tags/keywords，支持语义检索              │
-│  → 检索结果："找到 8 条相关最佳实践"                       │
-└──────────────────────────┬──────────────────────────────┘
-                           ↓ 检索命中的 Skills → 进入 Loop
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 2: AI 对话式需求补全 Loop                          │
-│  src/workflow/loop-engine.ts                            │
-│  → 不是展示问卷，而是 AI 以对话气泡的方式逐项询问            │
-│  → "我注意到你要实现登录，通常需要考虑双 Token 机制，        │
-│     它可以让 AT 短期有效而不必频繁重新登录，你需要吗？"       │
-│  → 用户回复 Yes/No 或追加说明                             │
-└──────────────────────────┬──────────────────────────────┘
-                           ↓ Loop 完成 → 生成 OpenSpec
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 3: OpenSpec（规范驱动核心）                         │
-│  openspec/                                              │
-│  ├── specs/auth-login/spec.md  ← 系统级规范（持久化）       │
-│  └── changes/add-login/        ← 本次变更                 │
-│      ├── proposal.md           ← 为什么做、做什么           │
-│      ├── design.md             ← 技术决策                  │
-│      ├── tasks.md              ← 实现任务清单               │
-│      └── specs/                ← spec delta               │
-│          └── auth-login/spec.md                          │
-└──────────────────────────┬──────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 4: 代码实现（严格对照 Spec）                        │
-│  src/components/Login/                                  │
-│  → 每个实现对应 Spec 中的一条 Requirement + Scenario       │
-└──────────────────────────┬──────────────────────────────┘
-                           ↓
-┌─────────────────────────────────────────────────────────┐
-│  LAYER 5: OpenSpec Verify（闭环验证）                      │
-│  /opsx:verify                                           │
-│  → AI 对照 spec.md 中的 Requirements 逐条检查实现          │
-│  → 在 Demo 的 UI 中可视化展示验证结果                      │
-└─────────────────────────────────────────────────────────┘
-```
-
-### 1.2 Demo 的两个层面
-
-**A. 工作流演示层（核心，在浏览器中交互）**
-
-- 一个交互式「需求 Loop」页面，模拟 AI 反问 Loop 的全过程
-- Loop 完成后展示自动生成的 OpenSpec 文档（proposal + spec delta）
-- 最终展示 Check 验证结果面板
-
-**B. 功能实现层（结果验证）**
-
-- 根据 OpenSpec `tasks.md` 实现的登录组件
-- 实现双 Token、防抖、表单校验、错误处理等最佳实践
-- 在 Demo UI 中对照 `spec.md` 做 Requirement-level 的可视化验证
-
----
-
-<!-- anchor:phase0 -->
-
-## 2. Phase 0 — 安装 OpenSpec & 初始化
-
-### 2.1 安装 OpenSpec
-
-```bash
-npm install -g @fission-ai/openspec@latest
-cd /path/to/my-react-app
-openspec init
-```
-
-执行后，项目根目录会生成：
-
-```
-openspec/
-├── specs/          ← 系统级规范库（跨 feature 持久化）
-└── changes/        ← 每次变更的 proposal/design/tasks/spec-delta
-```
-
-### 2.2 OpenSpec 核心工作流命令
-
-| 命令                             | 说明                                  |
-| -------------------------------- | ------------------------------------- |
-| `/openspec:proposal "add-login"` | 创建本次变更提案，生成 4 个 artifacts |
-| `/opsx:verify`                   | 对照 spec.md 逐条验证代码实现         |
-| `/opsx:archive`                  | 归档当前变更，更新系统级 specs        |
-
-OpenSpec 的哲学：**先对齐（align），再实现（implement）**。生成提案文档让人和 AI 在写代码前就对目标对齐，这正是我们的 Loop 要解决的问题。
-
----
-
-<!-- anchor:phase1 -->
-
-## 3. Phase 1 — 搭建基础工程环境
-
-### 3.1 安装前端依赖
-
-```bash
-# UI 组件 & 样式
-npm install tailwindcss @tailwindcss/vite
-
-# 表单校验（与 OpenSpec Scenario 对应验证用）
-npm install zod
-
-# 表单管理
-npm install react-hook-form @hookform/resolvers
-
-# 路由（页面切换）
-npm install react-router-dom
-
-# 工具函数
-npm install clsx
-```
-
-### 3.2 整体文件结构
+### 1.1 文件结构
 
 ```
 my-react-app/
-├── openspec/                      ← OpenSpec 规范层（Phase 0 生成）
-│   ├── specs/
-│   │   └── auth-login/
-│   │       └── spec.md            ← 系统级登录规范（归档后持久化）
-│   └── changes/
-│       └── add-login/
-│           ├── proposal.md        ← 变更提案：为什么做、做什么
-│           ├── design.md          ← 技术决策：双 Token 方案等
-│           ├── tasks.md           ← 实现任务清单（对应代码实现）
+├── openspec/
+│   ├── config.yaml                    ← 项目配置：设置默认 schema 为 loop-driven
+│   ├── schemas/
+│   │   └── loop-driven/               ← 自定义 Schema（核心产物）
+│   │       ├── schema.yaml            ← Workflow 定义（含新增的 requirement-loop artifact）
+│   │       └── templates/
+│   │           ├── requirement-loop.md ← Loop artifact 的模板（引导 AI 如何提问）
+│   │           ├── proposal.md
+│   │           ├── spec.md
+│   │           ├── design.md
+│   │           └── tasks.md
+│   ├── skills/                        ← Skill 知识库（最佳实践沉淀，供 AI 检索）
+│   │   ├── login.md                   ← 登录功能最佳实践
+│   │   ├── payment.md                 ← 支付功能最佳实践（未来扩展）
+│   │   └── README.md                  ← 说明如何使用 Skill 库
+│   ├── specs/                         ← 系统级规范（归档后持久化）
+│   └── changes/                       ← 每次变更目录
+│       └── add-login/                 ← 本次演示用的变更
+│           ├── requirement-loop.md    ← 需求确认文档（Loop 产物）
+│           ├── proposal.md
+│           ├── design.md
+│           ├── tasks.md
 │           └── specs/
 │               └── auth-login/
-│                   └── spec.md    ← spec delta（本次变更的规范）
-└── src/
-    ├── skills/
-    │   └── login-best-practices.ts   ← Skill 库（含 tags/keywords/aiQuestion）
-    ├── workflow/
-    │   ├── types.ts
-    │   ├── intent-matcher.ts         ← 意图检索：用户输入 → 匹配相关 Skills
-    │   ├── loop-engine.ts            ← Loop 状态机：idle→matching→confirming→done
-    │   └── spec-generator.ts         ← Spec 生成器：Loop 答案 → OpenSpec 文档
-    ├── components/
-    │   ├── WorkflowDemo/
-    │   │   ├── IntentInput.tsx        ← 意图输入框（对话起点）
-    │   │   ├── ChatLoop.tsx           ← 对话气泡式 Loop UI（核心组件）
-    │   │   ├── SpecViewer.tsx         ← Spec 文档展示（Markdown 渲染）
-    │   │   └── VerifyPanel.tsx        ← 验证面板：逐条 Requirement Check
-    │   └── Login/
-    │       ├── LoginForm.tsx          ← 登录表单（对照 spec tasks 实现）
-    │       └── useLoginLogic.ts       ← 登录逻辑 Hook
-    └── pages/
-        ├── WorkflowPage.tsx           ← 工作流演示主页（三步走）
-        └── LoginPage.tsx              ← 最终登录页
+│                   └── spec.md
+└── src/                               ← React 代码（按 tasks.md 实现）
+    └── components/
+        └── Login/
+            ├── LoginForm.tsx
+            └── useLoginLogic.ts
 ```
+
+### 1.2 工作流全景图
+
+两条触发路径，汇合后走相同的 Loop + OpenSpec 流程：
+
+**路径 A — 隐式触发（自然语言 → AI 主动建议）**
+
+```
+开发者: "帮我实现一个登录功能"
+  ↓
+AI 判断需求模糊（依赖 config.yaml 的 context rules 注入）
+  → 回复: "你的需求描述比较简短，为确保实现质量，建议先用
+            /opsx:propose 完善需求细节，是否继续？"
+  ↓ 用户确认
+进入 requirement-loop artifact
+```
+
+**路径 B — 显式触发（直接调用 propose）**
+
+```
+开发者: "/opsx:propose add-login"
+  ↓
+AI: "请简单描述你的登录功能需求（比如：面向什么用户、
+     有无特殊安全要求等），我来帮你完善规范。"
+  ↓ 用户输入需求描述
+进入 requirement-loop artifact
+```
+
+**两条路汇合后的统一流程：**
+
+```
+[requirement-loop artifact]
+AI 读取 openspec/skills/{feature}.md 知识库
+→ 逐条反问用户（在 AI IDE 对话框里，就是普通聊天）
+→ 用户回答 Yes/No 或追加参数说明
+→ 生成 requirement-loop.md
+
+→ proposal.md（基于确认需求）
+→ specs/auth-login/spec.md（GIVEN/WHEN/THEN）
+→ design.md（技术决策）
+→ tasks.md（实现清单）
+
+/opsx:apply  → 代码实现
+/opsx:verify → 规范验证
+```
+
+### 1.3 路径 A 的实现方式
+
+路径 A 不需要写代码，通过 `openspec/config.yaml` 的 `context` 向 AI 注入行为规则：
+
+```yaml
+# openspec/config.yaml
+context: |
+  当用户输入与功能实现相关的简短需求（如"帮我实现登录"、"做一个支付页面"），
+  且需求描述不够详细时，请主动提示：
+  "需求描述较模糊，建议先运行 /opsx:propose <feature-name> 完善需求细节，
+  以确保实现质量，是否继续？"
+
+  这样可以触发 requirement-loop，确保在写代码之前把需求对齐清楚。
+```
+
+这条 context 会被注入到所有 AI 响应的系统提示里，让 AI IDE 具备"主动建议进入 Loop"的行为。
 
 ---
 
-<!-- anchor:phase2 -->
+<!-- anchor:schema -->
 
-## 4. Phase 2 — Skill 库 + 意图检索 + 对话式 Loop 引擎
+## 2. 核心产物：loop-driven Schema
 
-### 4.0 整体流程（核心设计）
+### 2.1 schema.yaml
 
-**用户先表达意图，系统语义召回 Skill，再以 AI 对话气泡方式逐项确认，而不是展示一张静态问卷。**
+文件：`openspec/schemas/loop-driven/schema.yaml`
 
-```
-Step 1: 用户输入意图
-   → "我要实现一个登录功能"
+```yaml
+name: loop-driven
+version: 1
+description: |
+  需求 Loop 驱动的规范开发流程。
+  在生成 proposal 之前，先通过 AI 检索 Skill 知识库，
+  逐条与用户确认最佳实践，确保需求无遗漏后再进入实现阶段。
 
-Step 2: 系统语义检索（关键词 + 标签匹配）
-   → 匹配 Skills 库，找到 8 条相关最佳实践
-   → UI 展示："✨ 找到 8 条相关最佳实践，开始确认需求..."
+artifacts:
+  - id: requirement-loop
+    generates: requirement-loop.md
+    description: 需求确认文档（AI 检索 Skill 知识库后与用户逐条确认的结果）
+    template: requirement-loop.md
+    instruction: |
+      你是一个经验丰富的技术架构师。用户想要实现一个新功能。
 
-Step 3: AI 对话式逐条确认（非问卷列表）
-   → 以聊天气泡形式，每次一个问题，带上下文说明原因
-   → 用户可以回答 "需要" / "不需要" / 或追加补充说明
+      你的任务分两步：
 
-Step 4: Loop 完成 → 生成 OpenSpec 文档
-   → 自动生成 proposal.md + spec.md + design.md + tasks.md
-```
+      **Step 1: 检索 Skill 知识库**
+      读取 openspec/skills/ 目录下与当前功能相关的 Skill 文件。
+      根据用户描述的功能名称（如 "login"、"payment"），
+      找到对应的 skills/*.md 文件，提取其中的最佳实践列表。
 
-### 4.1 Skill 数据结构（新增 tags/keywords + 对话式问法）
+      **Step 2: 逐条需求确认（Loop）**
+      对检索到的每一条最佳实践：
+      1. 用自然语言向用户提问（包含：这是什么、为什么需要它、推荐默认值）
+      2. 等待用户回答（Yes/No 或追加说明）
+      3. 记录用户的选择和补充
 
-文件：`src/skills/login-best-practices.ts`
+      直到所有最佳实践都确认完毕，才能生成 requirement-loop.md。
 
-```typescript
-interface Skill {
-  id: string;
-  category: "security" | "ux" | "performance" | "architecture";
-  tags: string[]; // 语义检索标签，如 ['login', 'auth', '登录', '认证']
-  keywords: string[]; // 关键词列表，用于意图匹配
-  // AI 对话气泡的提问方式（自然语言，带上下文和原因）
-  aiQuestion: string;
-  defaultAnswer: boolean; // 推荐默认值
-  specRequirement: string; // Loop 选 Yes 时，写入 OpenSpec 的 Requirement 语句
-  skipIf?: string[]; // 当某些 skill 为 No 时跳过此问题
-}
-```
+      生成的 requirement-loop.md 必须包含：
+      - 用户的原始需求描述
+      - 每条最佳实践的确认结果（选择 + 具体参数）
+      - 明确的 Out of Scope（用户选择不实现的）
+    requires: []
 
-**关键区别：`aiQuestion` 是自然语言，包含上下文和原因：**
+  - id: proposal
+    generates: proposal.md
+    description: 变更提案
+    template: proposal.md
+    instruction: |
+      基于 requirement-loop.md 中已确认的需求，生成变更提案。
+      proposal 必须完整反映用户在 Loop 中确认的所有选项。
+    requires:
+      - requirement-loop # 必须先完成需求 Loop
 
-```typescript
-// ❌ 旧方式（静态问卷式，无上下文）
-question: "是否使用双 Token 机制？";
+  - id: specs
+    generates: specs/**/*.md
+    description: 功能规范（GIVEN/WHEN/THEN 格式）
+    template: spec.md
+    instruction: |
+      基于 proposal.md 和 requirement-loop.md，
+      为每一条已确认的需求生成对应的 Requirement + Scenario。
+      使用标准的 GIVEN/WHEN/THEN 格式。
+    requires:
+      - proposal
 
-// ✅ 新方式（AI 对话气泡，有上下文和理由）
-aiQuestion: `我注意到你要实现登录功能。通常建议使用
-双 Token（Access Token + Refresh Token）机制——AT 
-短期有效（15分钟），RT 长期有效（7天），这样既安全又
-不用频繁重新登录。你的项目需要这个吗？`;
-```
+  - id: design
+    generates: design.md
+    description: 技术设计文档
+    template: design.md
+    requires:
+      - specs
 
-**内置 Skills 列表（登录场景）：**
+  - id: tasks
+    generates: tasks.md
+    description: 实现任务清单
+    template: tasks.md
+    instruction: |
+      基于 design.md 和 specs，生成分阶段的实现任务清单。
+      每条任务必须能追溯到 spec.md 中的某个 Requirement。
+    requires:
+      - design
 
-| ID                 | tags（语义检索用）                                  | OpenSpec Requirement                                           |
-| ------------------ | --------------------------------------------------- | -------------------------------------------------------------- |
-| `dual-token`       | `['login', 'auth', 'token', '登录', '认证']`        | The system SHALL implement Access Token + Refresh Token        |
-| `debounce`         | `['login', 'form', 'submit', '登录', '表单']`       | The system SHALL debounce login submissions (300ms)            |
-| `form-validation`  | `['login', 'form', 'validate', '校验']`             | The system SHALL validate inputs in real-time via Zod          |
-| `password-encrypt` | `['login', 'password', 'security', '密码', '安全']` | The system SHALL encrypt passwords before transmission         |
-| `remember-me`      | `['login', 'session', 'persist', '记住我']`         | The system SHALL support persistent sessions via "Remember me" |
-| `captcha`          | `['login', 'security', 'captcha', '验证码']`        | The system SHALL require captcha after 3 failed attempts       |
-| `error-handling`   | `['login', 'error', 'feedback', '错误']`            | The system SHALL distinguish error types (account/password)    |
-| `loading-state`    | `['login', 'ux', 'loading', '加载']`                | The system SHALL show loading indicator during auth            |
-| `rate-limiting`    | `['login', 'security', 'brute-force', '限流']`      | The system SHALL lock login after N consecutive failures       |
-
-### 4.2 意图检索引擎
-
-文件：`src/workflow/intent-matcher.ts`
-
-```typescript
-interface IntentMatchResult {
-  userIntent: string; // 原始用户输入，如 "我要实现一个登录功能"
-  detectedFeature: string; // 解析出的功能类型，如 "login"
-  matchedSkills: Skill[]; // 语义匹配到的 Skill 列表（按相关度排序）
-  confidence: number; // 匹配置信度 0-1
-}
-```
-
-匹配策略（Demo 中用轻量级关键词匹配模拟语义检索）：
-
-1. 提取用户输入中的关键词（"登录"、"login"、"auth" 等）
-2. 与每条 Skill 的 `tags` 和 `keywords` 计算交集得分
-3. 得分 > 阈值的 Skill 进入候选列表，按分数降序排列
-4. 返回 Top N 条 Skill 作为本次 Loop 的问题队列
-
-> **真实场景扩展**：Demo 中用关键词匹配演示即可；真实产品可替换为向量 embedding 相似度检索。
-
-### 4.3 对话式 Loop 引擎
-
-文件：`src/workflow/loop-engine.ts`
-
-```typescript
-type LoopPhase =
-  | "idle" // 等待用户输入意图
-  | "matching" // 正在检索相关 Skills（带加载动画）
-  | "confirming" // AI 逐条对话确认（核心阶段）
-  | "generating" // 生成 OpenSpec 文档
-  | "done"; // 完成，展示 Spec
-
-interface LoopState {
-  phase: LoopPhase;
-  userIntent: string;
-  matchedSkills: Skill[];
-  currentSkillIndex: number;
-  answers: Record<string, boolean | string>; // string 支持用户追加说明
-  chatHistory: ChatMessage[]; // 完整对话记录（用于展示聊天界面）
-  generatedSpec: OpenSpecDraft | null;
-}
-
-interface ChatMessage {
-  role: "user" | "assistant";
-  content: string;
-  skillId?: string; // 对应哪个 Skill（用于侧边栏进度高亮）
-}
+apply:
+  requires: [tasks]
+  tracks: tasks.md
 ```
 
-**对话示例：**
+### 2.2 requirement-loop.md 模板
 
-```
-用户:  "我要实现一个登录功能"
-
-AI:    "好的，我找到了 8 条与「登录」相关的最佳实践，
-        让我们逐一确认你的需求 ↓"
-
-AI:    "我注意到你要实现登录功能。通常建议使用双 Token
-        机制——AT 短期有效（15分钟），RT 长期有效（7天）。
-        你的项目需要这个吗？"
-
-用户:  "需要，RT 有效期改成 30 天"
-
-AI:    "好的，记录：双 Token，RT=30天。
-        另外，为了防止重复提交，建议给登录按钮加
-        300ms 防抖。需要吗？"
-
-用户:  "需要"
-
-...（继续 8 条）
-
-AI:    "需求已全部确认！根据你的选择，我生成了
-        OpenSpec 文档，请查看 →"
-```
-
-### 4.4 Spec 生成器（Loop 答案 → OpenSpec 文档）
-
-文件：`src/workflow/spec-generator.ts`
-
-根据用户的 Loop 答案，自动生成符合 OpenSpec 格式的文档：
-
-**生成 `proposal.md`：**
+文件：`openspec/schemas/loop-driven/templates/requirement-loop.md`
 
 ```markdown
-# Proposal: Add Login Feature
+# Requirement Loop: {{feature-name}}
 
-## Why
+## 用户原始需求
 
-用户需要一个安全的登录入口来访问系统。
+<!-- 记录用户的原始输入，原文保留 -->
 
-## What's Changing
+## 检索到的相关最佳实践
 
-- 新增登录表单组件
-- 实现 [用户选择的特性列表]
+<!-- 列出从 Skill 知识库中找到的相关实践清单 -->
+
+## 需求确认结果
+
+<!-- 每条最佳实践的确认状态，格式如下：
+
+### ✅ [最佳实践名称]
+- **选择**: 需要
+- **参数**: [用户补充的具体参数，如 RT 有效期 = 30天]
+- **纳入规范**: The system SHALL ...
+
+### ❌ [最佳实践名称]
+- **选择**: 不需要
+- **原因**: [用户说明的原因，或 N/A]
+-->
 
 ## Out of Scope
 
-- [用户选择跳过的特性]
-```
-
-**生成 `specs/auth-login/spec.md`（spec delta）：**
-
-```markdown
-# auth-login Specification
-
-## Requirements
-
-### Requirement: [Skill.specRequirement]
-
-[Loop 中用户选 Yes 的每一条 Skill]
-
-#### Scenario: [对应场景]
-
-- GIVEN [前置条件]
-- WHEN [触发动作]
-- THEN [期望结果]
-```
-
-**生成 `tasks.md`：**
-
-```markdown
-# Implementation Tasks
-
-## Phase 1: Core Auth
-
-- [ ] 1.1 实现双 Token 存储和刷新逻辑
-- [ ] 1.2 实现登录 API 调用
-
-## Phase 2: UX
-
-- [ ] 2.1 实现防抖提交
-- [ ] 2.2 实现 Zod 表单校验
-```
-
-**生成 `design.md`：**
-
-```markdown
-# Technical Design
-
-## Token Storage Decision
-
-选择 localStorage 存储 AT（有 XSS 风险但开发方便）vs httpOnly Cookie（更安全）...
+<!-- 明确列出本次不实现的内容，防止后续争议 -->
 ```
 
 ---
 
-<!-- anchor:phase3 -->
+<!-- anchor:skills -->
 
-## 5. Phase 3 — 对照 OpenSpec Tasks 实现登录功能
+## 3. Skill 知识库
 
-### 5.1 OpenSpec `tasks.md` 驱动实现
+### 3.1 登录功能最佳实践
 
-对照 `openspec/changes/add-login/tasks.md` 中的每一条 Task 进行实现。每完成一条 Task 可在 Demo 的 VerifyPanel 中标记。
+文件：`openspec/skills/login.md`
 
-### 5.2 核心实现文件
+```markdown
+# Login Feature Skills
 
-**`src/components/Login/useLoginLogic.ts`**
+> 这是登录功能的最佳实践知识库。
+> 当用户要实现登录功能时，AI 应逐条确认以下实践。
 
-- 双 Token 管理（accessToken + refreshToken）
-- 防抖 Hook（`useDebounce`）
-- 失败次数计数器（限流）
-- Remember Me 逻辑
+## 最佳实践清单
 
-**`src/components/Login/LoginForm.tsx`**
+### 1. 双 Token 机制（dual-token）
 
-- React Hook Form + Zod 实时校验
-- Loading 状态管理
-- 细化错误类型展示
-- 密码可见切换
-
----
-
-<!-- anchor:phase4 -->
-
-## 6. Phase 4 — VerifyPanel（对照 OpenSpec spec.md 验证）
-
-### 6.1 核心思想
-
-将 OpenSpec `spec.md` 中的每一条 **Requirement** 和 **Scenario** 解析出来，在 Demo UI 中对照实际代码状态进行可视化展示。
-
-这模拟了 `/opsx:verify` 命令的效果（AI 对照 spec 逐条检查），只不过在 Demo 中以可视化 UI 呈现。
-
-### 6.2 VerifyPanel 数据结构
-
-文件：`src/components/WorkflowDemo/VerifyPanel.tsx`
-
-```typescript
-interface VerifyItem {
-  requirementId: string;
-  requirement: string; // 来自 spec.md 的 Requirement 描述
-  scenarios: {
-    given: string;
-    when: string;
-    then: string;
-  }[];
-  implementedBy: string; // 对应哪个代码文件/函数
-  status: "pass" | "fail" | "skip";
-}
-```
-
-**UI 展示：**
-
-- ✅ Pass：规范要求，已按 Scenario 实现
-- ❌ Fail：规范要求，未找到对应实现
-- ⏭ Skip：用户在 Loop 中选择了 No
-- 最终给出 "规范覆盖率" 百分比
+**分类**: Security
+**推荐**: ✅ 是
+**说明**: 使用 Access Token（AT，短期，建议 15 分钟）+ Refresh Token（RT，长期，建议 7 天）。
+AT 过期后用 RT 静默刷新，用户无感知。避免长期 Token 泄露风险。
+**需确认的参数**: AT 有效期、RT 有效期、Token 存储方式（localStorage / httpOnly Cookie）
 
 ---
 
-<!-- anchor:phase5 -->
+### 2. 登录按钮防抖（debounce）
 
-## 7. Phase 5 — 整合 UI & 展示效果
+**分类**: UX
+**推荐**: ✅ 是
+**说明**: 防止用户多次点击导致重复发送请求。建议 300ms 防抖 + 请求期间禁用按钮。
+**需确认的参数**: 防抖时长（默认 300ms）
 
-### 7.1 页面路由
+---
 
-- `/` → 工作流演示页（三步走：Loop → Spec → Verify）
-- `/login` → 最终产物：按照 Spec 实现的登录页
+### 3. 实时表单校验（form-validation）
 
-### 7.2 WorkflowPage 四阶段布局（新增意图输入阶段）
+**分类**: UX
+**推荐**: ✅ 是
+**说明**: 用户输入时即时提示错误（邮箱格式、密码强度），减少提交后报错的挫败感。
+**需确认的参数**: 校验时机（onBlur / onChange）、使用 Zod / Yup / 原生
+
+---
+
+### 4. 密码前端加密（password-encrypt）
+
+**分类**: Security
+**推荐**: ⚠️ 视情况
+**说明**: 在 HTTPS 普及的情况下，前端加密价值有限，但对安全要求高的场景（金融/企业）建议开启。
+**需确认的参数**: 加密算法（bcrypt 在前端不适用，通常用 SHA-256 或 RSA 公钥加密）
+
+---
+
+### 5. 记住我（remember-me）
+
+**分类**: UX
+**推荐**: ✅ 是
+**说明**: 允许用户选择是否保持登录状态更长时间（延长 RT 有效期或使用持久化存储）。
+**需确认的参数**: 记住时长（默认 30 天）、实现方式
+
+---
+
+### 6. 验证码（captcha）
+
+**分类**: Security
+**推荐**: ⚠️ 视情况
+**说明**: 防止暴力破解。可以在连续失败 N 次后触发（而非每次都要求）。
+**需确认的参数**: 触发条件（失败几次后）、类型（图片/短信/行为验证）
+
+---
+
+### 7. 细分错误类型（granular-errors）
+
+**分类**: UX
+**推荐**: ✅ 是
+**说明**: 区分"账号不存在"和"密码错误"的提示，帮助用户定位问题（注意：某些场景出于安全考虑故意模糊）。
+**需确认的参数**: 是否区分（部分场景为防止账号枚举攻击，应统一返回"账号或密码错误"）
+
+---
+
+### 8. Loading 状态（loading-state）
+
+**分类**: UX
+**推荐**: ✅ 是
+**说明**: 登录请求期间展示 Loading 指示器，防止用户以为没有响应而重复点击。
+**需确认的参数**: 展示方式（按钮 loading / 全屏遮罩）
+
+---
+
+### 9. 前端限流（rate-limiting）
+
+**分类**: Security
+**推荐**: ✅ 是
+**说明**: 前端记录失败次数，超过阈值后锁定登录一段时间（配合后端限流双重保障）。
+**需确认的参数**: 最大失败次数（默认 5）、锁定时长（默认 15 分钟）
+```
+
+### 3.2 README
+
+文件：`openspec/skills/README.md`
+
+```markdown
+# OpenSpec Skills 知识库
+
+这里存放各功能模块的最佳实践知识库，供 `requirement-loop` artifact 检索使用。
+
+## 结构
+
+- `login.md` — 登录/认证相关最佳实践
+- `payment.md` — 支付相关最佳实践（待补充）
+
+## 如何使用
+
+当 AI 执行 `requirement-loop` artifact 时，会自动读取本目录下与当前功能相关的文件。
+也可以在 `openspec/config.yaml` 的 context 里显式声明 Skills 路径。
+
+## 如何扩展
+
+为新功能添加 Skills：
+
+1. 在此目录新建 `{feature}.md`
+2. 按照现有格式填写最佳实践清单
+3. 每条实践包含：分类、推荐程度、说明、需确认的参数
+```
+
+---
+
+<!-- anchor:config -->
+
+## 4. 项目配置
+
+### 4.1 config.yaml
+
+文件：`openspec/config.yaml`
+
+```yaml
+schema: loop-driven # 设置 loop-driven 为默认 schema
+
+context: |
+  Tech stack: TypeScript, React 19, Vite, Tailwind CSS
+  Form validation: Zod + React Hook Form
+  Auth pattern: JWT (Access Token + Refresh Token)
+  State management: React hooks (no Redux)
+
+  当执行 requirement-loop 时，请读取 openspec/skills/ 目录下对应的 Skill 文件。
+
+rules:
+  requirement-loop:
+    - 必须逐条询问，不得跳过任何 Skill
+    - 每个问题都要说明"为什么需要它"
+    - 用户的补充说明必须原文记录到 requirement-loop.md
+    - 生成文档前必须得到用户对所有条目的明确答复
+  specs:
+    - 使用 Given/When/Then 格式
+    - 每条 Requirement 必须能追溯到 requirement-loop.md 中的某个确认结果
+  tasks:
+    - 每个 Task 必须注明对应的 spec Requirement ID
+```
+
+---
+
+<!-- anchor:demo -->
+
+## 5. 完整演示流程
+
+### 5.1 路径 A 演示（隐式触发：模糊需求 → AI 主动建议）
 
 ```
-[阶段 0: 意图输入]       [阶段 1: 对话式 Loop]      [阶段 2: OpenSpec]        [阶段 3: 验证]
-┌─────────────────┐     ┌──────────────────────┐   ┌──────────────────┐    ┌────────────────┐
-│ � 描述你的需求  │ →→→ │ 🤖 AI 对话气泡        │   │ 📄 proposal.md   │    │ ✅ Verify      │
-│                 │     │ ──────────────────── │   │ 📋 spec delta    │    │                │
-│  "我要实现一个   │     │ AI: "我找到 8 条相    │   │ 🔧 design.md     │    │ 覆盖率: 92%    │
-│   登录功能"     │     │      关实践，逐一确   │   │ ✅ tasks.md      │    │                │
-│                 │     │      认..."           │   │                  │    │ ✅ dual-token  │
-│ [开始分析 →]   │     │ AI: "是否需要双        │   │ [Markdown 渲染]  │    │ ✅ debounce    │
-│                 │     │      Token？AT 15min  │   │                  │    │ ❌ captcha     │
-│ 右侧匹配到的     │     │      RT 7天..."       │   │ [复制] [下载]    │    │ ✅ loading...  │
-│ Skills 预览      │     │ 用: "需要，RT 30天"   │   │                  │    │                │
-│ ✨ 找到 8 条     │     │ AI: "好的！防抖呢？"  │   │                  │    │ [查看登录页 →] │
-└─────────────────┘     └──────────────────────┘   └──────────────────┘    └────────────────┘
+开发者: "帮我实现一个登录功能"
+
+AI:     "你的需求描述比较简短，为确保实现符合最佳实践，
+         建议先用 /opsx:propose 完善需求细节，是否继续？"
+
+开发者: "好的"
+
+AI:     "请简单描述你的登录场景（比如：B端还是C端？
+         有无特殊安全要求？目标用户量？）"
+
+开发者: "C端用户，日活10万，需要比较严格的安全控制"
+
+AI:     "明白了。检索登录知识库...
+         找到 9 条相关实践，我们逐一确认 ↓"
+         [进入 Loop →]
+```
+
+### 5.2 路径 B 演示（显式触发：直接 /opsx:propose）
+
+```
+开发者: /opsx:propose add-login
+
+AI:     "请简单描述你的登录功能需求。"
+
+开发者: "标准账号密码登录，C端，安全性要求较高"
+
+AI:     "好的，检索登录知识库... 找到 9 条相关实践，逐一确认 ↓"
+         [进入 Loop →]
+```
+
+### 5.3 Loop 对话（两条路径汇合后相同）
+
+```
+AI：[1/9] 双 Token 机制
+    建议使用 Access Token（短期，15分钟）+ Refresh Token（长期，7天）。
+    AT 过期后用 RT 静默刷新，用户无感知，避免长期 Token 泄露。
+    你的项目需要这个吗？如果需要，AT 和 RT 的有效期用默认值吗？
+
+用户：需要，RT 改成 30 天
+
+AI：记录 ✅ 双 Token，AT=15min，RT=30天。
+
+    [2/9] 登录按钮防抖
+    防止多次点击重复发送请求，建议 300ms 防抖 + 请求期间禁用按钮。需要吗？
+
+用户：需要
+
+...（9条全部确认）
+
+AI：需求确认完成！
+    生成 requirement-loop.md ✓
+    生成 proposal.md ✓
+    生成 specs/auth-login/spec.md ✓
+    生成 design.md ✓
+    生成 tasks.md ✓
+
+    所有文档已就绪，请审阅后运行 /opsx:apply 开始实现。
 ```
 
 ---
 
 <!-- anchor:impl-order -->
 
-## 8. 实施顺序
+## 6. 实施顺序
 
-| 步骤 | 任务                                             | 文件                                          | 优先级 |
-| ---- | ------------------------------------------------ | --------------------------------------------- | ------ |
-| 0    | 安装 OpenSpec CLI & 初始化                       | `openspec/`                                   | P0     |
-| 1    | 安装前端依赖、配置 Tailwind、配置路由            | `package.json`, `vite.config.ts`              | P0     |
-| 2    | 定义 Skill 数据库（含 tags/keywords/aiQuestion） | `src/skills/login-best-practices.ts`          | P0     |
-| 3    | 实现意图检索引擎                                 | `src/workflow/intent-matcher.ts`              | P0     |
-| 4    | 实现对话式 Loop 状态机                           | `src/workflow/loop-engine.ts`                 | P0     |
-| 5    | 实现 Spec 生成器（输出 OpenSpec 格式 Markdown）  | `src/workflow/spec-generator.ts`              | P0     |
-| 6    | 实现意图输入组件（对话起点）                     | `src/components/WorkflowDemo/IntentInput.tsx` | P1     |
-| 7    | 实现对话气泡式 Loop UI                           | `src/components/WorkflowDemo/ChatLoop.tsx`    | P1     |
-| 8    | 实现 Spec 文档查看器（Markdown 渲染）            | `src/components/WorkflowDemo/SpecViewer.tsx`  | P1     |
-| 9    | 实现 VerifyPanel（对照 spec.md 验证）            | `src/components/WorkflowDemo/VerifyPanel.tsx` | P1     |
-| 10   | 实现登录逻辑 Hook（对照 tasks.md 实现）          | `src/components/Login/useLoginLogic.ts`       | P1     |
-| 11   | 实现登录表单组件                                 | `src/components/Login/LoginForm.tsx`          | P1     |
-| 12   | 手工创建初始 OpenSpec 文档（演示用）             | `openspec/changes/add-login/`                 | P1     |
-| 13   | 组装 WorkflowPage（四阶段步骤导向）              | `src/pages/WorkflowPage.tsx`                  | P2     |
-| 14   | 组装 LoginPage                                   | `src/pages/LoginPage.tsx`                     | P2     |
-| 15   | 更新 App.tsx 路由                                | `src/App.tsx`                                 | P2     |
+| 步骤 | 任务                       | 文件                                                         | 说明                                           |
+| ---- | -------------------------- | ------------------------------------------------------------ | ---------------------------------------------- |
+| 1    | 安装 OpenSpec CLI          | —                                                            | `npm install -g @fission-ai/openspec@latest`   |
+| 2    | 初始化 OpenSpec            | `openspec/`                                                  | `openspec init` 生成基础目录                   |
+| 3    | Fork 内置 schema           | `openspec/schemas/loop-driven/`                              | `openspec schema fork spec-driven loop-driven` |
+| 4    | 编写 Skill 知识库          | `openspec/skills/login.md`                                   | 核心产物，包含 9 条登录最佳实践                |
+| 5    | 修改 schema.yaml           | `openspec/schemas/loop-driven/schema.yaml`                   | 新增 `requirement-loop` artifact，调整依赖链   |
+| 6    | 编写 Loop 模板             | `openspec/schemas/loop-driven/templates/requirement-loop.md` | AI 生成 requirement-loop 文档的结构模板        |
+| 7    | 配置 config.yaml           | `openspec/config.yaml`                                       | 设置默认 schema + 注入 context + Loop 规则     |
+| 8    | 验证 schema                | —                                                            | `openspec schema validate loop-driven`         |
+| 9    | 执行演示 Loop              | `openspec/changes/add-login/`                                | `/opsx:propose add-login` 跑通完整流程         |
+| 10   | 对照 tasks.md 实现登录组件 | `src/components/Login/`                                      | 这是最终的代码产物                             |
+| 11   | 执行 verify                | —                                                            | `/opsx:verify` 验证覆盖率                      |
 
 ---
 
 <!-- anchor:key-insight -->
 
-## 9. 核心设计哲学（Demo 要传递的思想）
+## 7. 核心设计哲学
 
-1. **Skill = 最佳实践知识库**：团队沉淀的经验，以机器可读的方式存储，而非散落在 Wiki 文档里
+1. **Skill 库 = 沉淀在版本控制里的最佳实践**
+   - 不是散落在 Wiki 里的文档，而是 `openspec/skills/*.md`，随代码一起 git 管理
+   - 新人入职可以直接读；AI 接任务也可以直接读
 
-2. **Loop = 意图驱动的需求对齐自动化**：
-   - 用户先用自然语言描述意图（"我要实现登录功能"）
-   - 系统语义检索匹配相关 Skill（关键词匹配，可扩展为 embedding 检索）
-   - AI 以对话气泡方式逐条确认，而非展示静态问卷
-   - 最终输出 OpenSpec 提案（proposal + spec + design + tasks）
+2. **Loop = OpenSpec 工作流的前置环节，不是独立 App**
+   - 通过自定义 Schema 的 `requirement-loop` artifact 实现
+   - 运行在 AI IDE 的对话框里，用户体验与正常聊天无异
+   - 完成后自动衔接后续的 proposal/specs/design/tasks
 
-3. **OpenSpec = 代码与需求的唯一真相来源**：
-   - `spec.md` 中的 GIVEN/WHEN/THEN 是人类可读的规范
-   - `tasks.md` 是 AI 实现时的任务清单
-   - `proposal.md` 是变更的"为什么"存档
-   - 一份 spec 可以跨多个 feature 复用和累积
+3. **OpenSpec = 唯一真相来源**
+   - `spec.md` 里的 GIVEN/WHEN/THEN 是可验证的规范
+   - `requirement-loop.md` 存档了"为什么这样设计"的决策过程
+   - `tasks.md` 是代码实现的 checklist
 
-4. **Verify = 闭环保障**：
-   - OpenSpec 的 `/opsx:verify` 让 AI 对照 spec.md 逐条检查代码
-   - Demo 的 VerifyPanel 把这个过程可视化
-   - 消除"我以为实现了"的幻觉
+4. **Verify = 闭环，不是摆设**
+   - `/opsx:verify` 让 AI 对照 spec.md 逐条检查实现
+   - 每个 task 都能追溯到 spec 的 Requirement，形成完整的可追溯链
 
-5. **可扩展性**：
-   - `openspec/specs/` 随着项目迭代不断积累，形成越来越完整的系统规范库
-   - 新人入职读 `specs/` 就能理解系统；AI 接任务读 `specs/` 就能理解上下文
-   - 这套工作流不局限于登录，任何功能（支付、搜索、上传）都可以走 `opsx:proposal` 流程
+5. **可扩展性**
+   - 想支持支付功能？新建 `openspec/skills/payment.md` 即可
+   - 这套 Schema 和 Skills 库可以在团队内所有项目共享
